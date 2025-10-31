@@ -93,7 +93,6 @@ if (is.null(colnames(rna_counts)) || ncol(rna_counts) == 0) {
 rna_counts <- set_rownames_from_first_col(rna_counts)
 colnames(rna_counts) <- clean_id(colnames(rna_counts))
 
-## 1) Auto-detect clinical ID column by overlap with counts (16-char or 12-char) ----
 char_cols <- names(rna_clinical)[vapply(rna_clinical, function(z) is.character(z) || is.factor(z), TRUE)]
 if (!length(char_cols)) stop("Clinical file has no character/factor columns to match IDs.")
 
@@ -133,7 +132,6 @@ if (!length(common_keys)) {
   stop("Could not align clinical and count IDs (using top-scoring clinical ID column).")
 }
 
-## 2) Collapse counts to unique sample keys (handles multiple aliquots per sample) ----
 # map each original column to its normalized key, keep only keys we can match
 map_df <- data.frame(orig = count_ids_raw, key = ckey_all, stringsAsFactors = FALSE)
 map_df <- map_df[map_df$key %in% common_keys, , drop = FALSE]
@@ -209,7 +207,6 @@ colData_df <- clin_matched[, design_vars, drop = FALSE]
 need_cols <- design_vars
 colData_df <- colData_df[stats::complete.cases(colData_df[, need_cols, drop = FALSE]), , drop = FALSE]
 
-# keep counts for retained samples; integers for DESeq2
 rna_counts <- rna_counts[, rownames(colData_df), drop = FALSE]
 mode(rna_counts) <- "numeric"
 rna_counts <- round(as.matrix(rna_counts))
@@ -217,7 +214,6 @@ rna_counts <- round(as.matrix(rna_counts))
 keep_genes <- rowSums(rna_counts, na.rm = TRUE) >= 1000
 rna_counts_filt <- rna_counts[keep_genes, , drop = FALSE]
 
-## Diagnostics ----
 cat("Clinical ID column used:", clin_id_col, "\n")
 cat("Aligned on:", if (use_16) "16-char sample keys" else "12-char patient keys", "\n")
 cat("# samples kept:", ncol(rna_counts_filt), " | # genes kept:", nrow(rna_counts_filt), "\n")
@@ -230,19 +226,16 @@ print(table(colData_df[[def_col]], useNA = "ifany"))
 *3*
 Perform the differential expression analysis, All you need to do is fill in the appropriate # terms
 ```{r}
-# ---- Problem 3 (full-rank safe): choose 2 groups, build design, auto-simplify if not full rank ----
 suppressPackageStartupMessages({ library(DESeq2) })
 
 stopifnot(exists("rna_counts_filt"), exists("colData_df"), exists("def_col"), exists("rna_genes"))
 
-## 0) Sync samples between counts and colData
 common_keys <- intersect(colnames(rna_counts_filt), rownames(colData_df))
 if (!length(common_keys)) stop("No overlapping samples between rna_counts_filt and colData_df.")
 rna_counts_filt <- rna_counts_filt[, common_keys, drop = FALSE]
 colData_df      <- colData_df[common_keys, , drop = FALSE]
 stopifnot(identical(colnames(rna_counts_filt), rownames(colData_df)))
 
-## 1) Choose a usable 2-group variable: definition -> PAM50 (top2) -> age median split
 pick_group <- function(df, prefer_col = NULL) {
   if (!is.null(prefer_col) && prefer_col %in% names(df)) {
     y <- droplevels(factor(df[[prefer_col]]))
@@ -280,7 +273,6 @@ colData_df[[grp_col]] <- droplevels(choice$vec)
 if ("Normal" %in% levels(colData_df[[grp_col]]))
   colData_df[[grp_col]] <- stats::relevel(colData_df[[grp_col]], ref = "Normal")
 
-## 2) Build covariates (drop constants), then drop rows with NA in any design term
 covars_all <- setdiff(colnames(colData_df), grp_col)
 keep_covars <- character(0)
 for (cn in covars_all) {
@@ -306,7 +298,6 @@ colData_df[[grp_col]] <- droplevels(colData_df[[grp_col]])
 if (nlevels(colData_df[[grp_col]]) < 2)
   stop("After NA removal, grouping variable '", grp_col, "' has <2 levels.")
 
-## 3) Try full design; if not full rank, fall back to ~ group only
 make_dds <- function(terms) {
   form <- as.formula(paste("~", paste(terms, collapse = " + ")))
   # drop constant columns detected via model.matrix (keep intercept)
@@ -327,12 +318,10 @@ make_dds <- function(terms) {
 
 attempt <- try(make_dds(design_terms), silent = TRUE)
 if (inherits(attempt, "try-error")) {
-  # if it failed before, force minimal model
   message("Falling back to minimal design: ~ ", grp_col)
   attempt <- make_dds(grp_col)
 }
 
-# Now try DESeq(); if full-rank error occurs, simplify to ~ group
 dds_obj <- try(DESeq(attempt$dds), silent = TRUE)
 if (inherits(dds_obj, "try-error") &&
     grepl("not full rank", conditionMessage(attr(dds_obj, "condition")), ignore.case = TRUE)) {
@@ -356,7 +345,6 @@ results <- as.data.frame(res)
 
 Prepare results dataframe for EnhancedVolcano plotting. Add two columns, "-log10(padj)" and "gene_name". Fill in these columns appropriately.
 ```{r}
-## 5) Prep for EnhancedVolcano
 results$padj[is.na(results$padj)] <- 1
 results$`-log10(padj)` <- -log10(pmax(results$padj, .Machine$double.eps))
 
@@ -376,7 +364,6 @@ head(results[, c("log2FoldChange","padj","-log10(padj)","gene_name")])
 
 ```
 ```{r}
-# ---- Problem 4: install/load EnhancedVolcano and plot ----
 if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
 if (!requireNamespace("EnhancedVolcano", quietly = TRUE)) {
   BiocManager::install("EnhancedVolcano", ask = FALSE, update = FALSE)
@@ -394,9 +381,6 @@ p <- EnhancedVolcano(
   pointSize = 1.0,
   labSize   = 5.0
 )
-
-# Optional: save the figure next to your Rmd
-# ggsave("volcano_contrast.png", p, width = 8, height = 6, dpi = 300)
 
 ```
 
