@@ -1,0 +1,430 @@
+---
+title: "Intro to Transcriptomics"
+author: Nicole Black, Wade Boohar, Kayla Xu
+date: 07/17/22
+updated: 10/18/24
+---
+
+***Deliverables***
+-Upload this R Notebook to your GitHub and submit the link to your Repo on Brightspace.
+-Include any graphs or figures created in this assignment in the folder with your R notebook with descriptive file names.
+
+Since this is an optional partner activity, it is okay if your answers are the same as your partner’s as long as everyone understands it and could explain it in their own words if asked. Each person must individually push their code to Github. *At the top of your R Notebook, write the name of you and your partner(s) as a comment.*
+
+***Complete the following coding activity and answer any following questions as comments in your R Notebook***
+
+In SummarizedExperiment Tutorial, you learned how to manipulate the SummarizedExperiment data structure and turn it into more readable dataframes, saving them as rna_counts, rna_clinical, and rna_genes. In this semi-guided assignment, you will use these dataframes to perform differential expression analysis based on tumor status.
+
+*Pre-Assignment*
+Use knitr function to set your working directory to your analysis_data folder in 490_cluster.
+```{r setup}
+ knitr::opts_knit$set(root.dir = normalizePath("/home1/nickyho/490_cluster/analysis_data/"))
+```
+
+If DESeq2 is not already installed, install it now
+```{r}
+if (!require("DESeq2", quietly = TRUE))
+BiocManager::install("DESeq2")
+```
+
+Load in all necessary packages
+```{r}
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+```
+
+
+
+*1*
+Read in the rna_clinical, rna_genes, and rna_counts dataframes which you made in the "SummarizedExperiment Guided Tutorial" R Notebook
+
+```{r}
+
+rna_clinical <- read.csv("/home1/nickyho/490_cluster/analysis_data/brca_rna_clinical_data.csv")
+rna_counts <- read.csv("/home1/nickyho/490_cluster/analysis_data/brca_rna_count_data.csv")
+rna_genes <- read.csv("/home1/nickyho/490_cluster/analysis_data/brca_rna_gene_data.csv")
+
+```
+
+
+*2*
+In this assignment, you will run differential expression analysis comparing patient samples by whether the sample is from a tumor or normal tissue (this is the definition column in rna_clinical). You will need to choose a variable to control for covariance of: age and/or PAM50 subtype (paper_BRCA_Subtype_PAM50). 
+
+Manipulate those columns so that they are ready for differential expression analysis (hint: what kind of variables are they? what data type are they by default? do you need to handle unknown values?) Filter out genes with a total expression across all patients less than 1000.
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(stringr)
+})
+
+## Helpers ----
+first_or_na <- function(x) if (length(x)) x[1] else NA_character_
+
+set_rownames_from_first_col <- function(df) {
+  if (!is.null(df) && ncol(df) > 1) {
+    first <- df[[1]]
+    if (is.character(first) || is.factor(first)) {
+      rn <- as.character(first)
+      if (length(unique(rn)) == nrow(df)) {
+        rownames(df) <- rn
+        df <- df[, -1, drop = FALSE]
+      }
+    }
+  }
+  df
+}
+
+clean_id <- function(x) {
+  x <- as.character(x)
+  x <- gsub("\\.", "-", x)                      # dots -> dashes
+  x <- gsub("^X(?=[A-Z0-9])", "", x, perl=TRUE) # drop R's leading X
+  toupper(x)
+}
+
+norm16 <- function(x) substr(clean_id(x), 1, 16)  # TCGA sample barcode: e.g., TCGA-AB-1234-01A
+norm12 <- function(x) substr(clean_id(x), 1, 12)  # TCGA patient barcode: e.g., TCGA-AB-1234
+
+if (is.null(colnames(rna_counts)) || ncol(rna_counts) == 0) {
+  message("Re-loading rna_counts with check.names=FALSE, row.names=1 ...")
+  rna_counts <- read.csv("/home1/nickyho/490_cluster/analysis_data/brca_rna_count_data.csv",
+                         check.names = FALSE, row.names = 1)
+}
+rna_counts <- set_rownames_from_first_col(rna_counts)
+colnames(rna_counts) <- clean_id(colnames(rna_counts))
+
+## 1) Auto-detect clinical ID column by overlap with counts (16-char or 12-char) ----
+char_cols <- names(rna_clinical)[vapply(rna_clinical, function(z) is.character(z) || is.factor(z), TRUE)]
+if (!length(char_cols)) stop("Clinical file has no character/factor columns to match IDs.")
+
+counts_n16 <- unique(norm16(colnames(rna_counts)))
+counts_n12 <- unique(norm12(colnames(rna_counts)))
+
+scores <- do.call(rbind, lapply(char_cols, function(cn) {
+  v <- rna_clinical[[cn]]
+  data.frame(
+    col = cn,
+    overlap16 = length(intersect(counts_n16, unique(norm16(v)))),
+    overlap12 = length(intersect(counts_n12, unique(norm12(v)))),
+    stringsAsFactors = FALSE
+  )
+}))
+scores <- scores[order(-pmax(scores$overlap16, scores$overlap12)), , drop = FALSE]
+
+if (nrow(scores) == 0 || max(scores$overlap16, scores$overlap12) == 0) {
+  cat("No overlap found. Example counts colnames:\n"); print(utils::head(colnames(rna_counts)))
+  cat("\nPeek at clinical text columns:\n"); print(utils::head(rna_clinical[, char_cols, drop = FALSE]))
+  stop("Could not align clinical and count IDs (after cleaning).")
+}
+
+clin_id_col <- scores$col[1]
+use_16 <- scores$overlap16[1] >= scores$overlap12[1]
+
+clin_ids_raw  <- rna_clinical[[clin_id_col]]
+count_ids_raw <- colnames(rna_counts)
+
+# Keys for matching
+ckey_all <- if (use_16) norm16(count_ids_raw) else norm12(count_ids_raw)
+kkey_all <- if (use_16) norm16(clin_ids_raw)  else norm12(clin_ids_raw)
+
+common_keys <- intersect(unique(ckey_all), unique(kkey_all))
+if (!length(common_keys)) {
+  print(scores[1:min(5, nrow(scores)), ])
+  stop("Could not align clinical and count IDs (using top-scoring clinical ID column).")
+}
+
+## 2) Collapse counts to unique sample keys (handles multiple aliquots per sample) ----
+# map each original column to its normalized key, keep only keys we can match
+map_df <- data.frame(orig = count_ids_raw, key = ckey_all, stringsAsFactors = FALSE)
+map_df <- map_df[map_df$key %in% common_keys, , drop = FALSE]
+
+# aggregate counts by key (sum across aliquots)
+if (any(duplicated(map_df$key))) {
+  # rowsum works on rows, so transpose twice
+  collapsed <- rowsum(t(as.matrix(rna_counts[, map_df$orig, drop = FALSE])), group = map_df$key)
+  rna_counts_aggr <- t(collapsed)
+} else {
+  rna_counts_aggr <- rna_counts[, map_df$orig, drop = FALSE]
+  colnames(rna_counts_aggr) <- map_df$key
+}
+
+# ensure final colnames ARE the normalized keys
+colnames(rna_counts_aggr) <- unique(map_df$key)
+
+rna_clinical$.__key__ <- kkey_all
+clin_matched <- rna_clinical[rna_clinical$.__key__ %in% colnames(rna_counts_aggr), , drop = FALSE]
+clin_matched <- clin_matched[!duplicated(clin_matched$.__key__), , drop = FALSE]
+rownames(clin_matched) <- clin_matched$.__key__
+clin_matched$.__key__ <- NULL
+
+count_keys <- colnames(rna_counts_aggr)
+clin_keys  <- rownames(clin_matched)
+common_keys2 <- intersect(count_keys, clin_keys)
+if (!length(common_keys2)) {
+  cat("No common keys after collapsing.\n")
+  cat("Example count keys:\n"); print(utils::head(count_keys))
+  cat("Example clinical keys:\n"); print(utils::head(clin_keys))
+  stop("Could not align: 0 common sample IDs between counts and clinical.")
+}
+rna_counts <- rna_counts_aggr[, common_keys2, drop = FALSE]
+clin_matched <- clin_matched[common_keys2, , drop = FALSE]
+cat("Aligned samples:", length(common_keys2),
+    " | dropped from counts:", length(setdiff(count_keys, common_keys2)),
+    " | dropped from clinical:", length(setdiff(clin_keys, common_keys2)), "\n")
+
+def_candidates <- c("definition","Definition","sample_type","Sample Type","sample.type")
+def_col <- first_or_na(intersect(def_candidates, names(clin_matched)))
+if (is.na(def_col)) stop("Could not find a 'definition' or 'sample_type' column in rna_clinical.")
+
+lab <- as.character(clin_matched[[def_col]])
+lab <- dplyr::case_when(
+  stringr::str_detect(lab, regex("normal", ignore_case = TRUE)) ~ "Normal",
+  stringr::str_detect(lab, regex("tumou?r|primary", ignore_case = TRUE)) ~ "Tumor",
+  TRUE ~ NA_character_
+)
+clin_matched[[def_col]] <- factor(lab)
+if ("Normal" %in% levels(clin_matched[[def_col]]))
+  clin_matched[[def_col]] <- stats::relevel(clin_matched[[def_col]], ref = "Normal")
+
+age_candidates   <- c("age_at_diagnosis","age_at_initial_pathologic_diagnosis","age",
+                      "diagnosis_age","vital_status_age","years_to_birth")
+pam50_candidates <- c("paper_BRCA_Subtype_PAM50","PAM50","pam50","PAM50_subtype")
+
+age_col   <- first_or_na(intersect(age_candidates, names(clin_matched)))
+pam50_col <- first_or_na(intersect(pam50_candidates, names(clin_matched)))
+
+if (!is.na(age_col)) {
+  age_num <- suppressWarnings(as.numeric(clin_matched[[age_col]]))
+  if (median(age_num, na.rm = TRUE) > 200) age_num <- age_num/365.25  # days -> years if needed
+  clin_matched[[age_col]] <- age_num
+}
+if (!is.na(pam50_col)) {
+  pam <- as.character(clin_matched[[pam50_col]])
+  pam[pam %in% c("Unknown","Not Available","","NA","N/A")] <- NA_character_
+  clin_matched[[pam50_col]] <- factor(pam)
+}
+
+design_vars <- c(def_col, if (!is.na(age_col)) age_col, if (!is.na(pam50_col)) pam50_col)
+colData_df <- clin_matched[, design_vars, drop = FALSE]
+need_cols <- design_vars
+colData_df <- colData_df[stats::complete.cases(colData_df[, need_cols, drop = FALSE]), , drop = FALSE]
+
+# keep counts for retained samples; integers for DESeq2
+rna_counts <- rna_counts[, rownames(colData_df), drop = FALSE]
+mode(rna_counts) <- "numeric"
+rna_counts <- round(as.matrix(rna_counts))
+
+keep_genes <- rowSums(rna_counts, na.rm = TRUE) >= 1000
+rna_counts_filt <- rna_counts[keep_genes, , drop = FALSE]
+
+## Diagnostics ----
+cat("Clinical ID column used:", clin_id_col, "\n")
+cat("Aligned on:", if (use_16) "16-char sample keys" else "12-char patient keys", "\n")
+cat("# samples kept:", ncol(rna_counts_filt), " | # genes kept:", nrow(rna_counts_filt), "\n")
+print(table(colData_df[[def_col]], useNA = "ifany"))
+
+
+```
+
+
+*3*
+Perform the differential expression analysis, All you need to do is fill in the appropriate # terms
+```{r}
+# ---- Problem 3 (full-rank safe): choose 2 groups, build design, auto-simplify if not full rank ----
+suppressPackageStartupMessages({ library(DESeq2) })
+
+stopifnot(exists("rna_counts_filt"), exists("colData_df"), exists("def_col"), exists("rna_genes"))
+
+## 0) Sync samples between counts and colData
+common_keys <- intersect(colnames(rna_counts_filt), rownames(colData_df))
+if (!length(common_keys)) stop("No overlapping samples between rna_counts_filt and colData_df.")
+rna_counts_filt <- rna_counts_filt[, common_keys, drop = FALSE]
+colData_df      <- colData_df[common_keys, , drop = FALSE]
+stopifnot(identical(colnames(rna_counts_filt), rownames(colData_df)))
+
+## 1) Choose a usable 2-group variable: definition -> PAM50 (top2) -> age median split
+pick_group <- function(df, prefer_col = NULL) {
+  if (!is.null(prefer_col) && prefer_col %in% names(df)) {
+    y <- droplevels(factor(df[[prefer_col]]))
+    if (nlevels(y) >= 2) return(list(col = prefer_col, vec = y))
+  }
+  pam50_cols <- c("paper_BRCA_Subtype_PAM50","PAM50","pam50","PAM50_subtype")
+  pam_col <- pam50_cols[pam50_cols %in% names(df)][1]
+  if (!is.na(pam_col)) {
+    pam <- droplevels(factor(df[[pam_col]]))
+    if (nlevels(pam) >= 2) {
+      tab <- sort(table(pam), decreasing = TRUE)
+      keep_lvls <- names(tab)[1:2]
+      grp <- factor(ifelse(pam %in% keep_lvls, as.character(pam), NA), levels = keep_lvls)
+      if (sum(!is.na(grp)) >= 4 && nlevels(droplevels(grp)) == 2)
+        return(list(col = "auto_group_pam50", vec = grp))
+    }
+  }
+  age_cols <- c("age_at_diagnosis","age_at_initial_pathologic_diagnosis","age",
+                "diagnosis_age","vital_status_age","years_to_birth")
+  age_col <- age_cols[age_cols %in% names(df)][1]
+  if (!is.na(age_col)) {
+    a <- suppressWarnings(as.numeric(df[[age_col]]))
+    if (!all(is.na(a)) && sd(a, na.rm = TRUE) > 0 && sum(!is.na(a)) >= 4) {
+      m <- median(a, na.rm = TRUE)
+      grp <- factor(ifelse(a < m, "AgeLow", "AgeHigh"), levels = c("AgeLow","AgeHigh"))
+      return(list(col = "auto_group_age", vec = grp))
+    }
+  }
+  stop("No usable two-group variable found (no Normal; PAM50/age not usable).")
+}
+
+choice   <- pick_group(colData_df, prefer_col = def_col)
+grp_col  <- choice$col
+colData_df[[grp_col]] <- droplevels(choice$vec)
+if ("Normal" %in% levels(colData_df[[grp_col]]))
+  colData_df[[grp_col]] <- stats::relevel(colData_df[[grp_col]], ref = "Normal")
+
+## 2) Build covariates (drop constants), then drop rows with NA in any design term
+covars_all <- setdiff(colnames(colData_df), grp_col)
+keep_covars <- character(0)
+for (cn in covars_all) {
+  v <- colData_df[[cn]]
+  if (all(is.na(v))) next
+  if (is.numeric(v)) {
+    if (isTRUE(all.equal(stats::sd(v, na.rm = TRUE), 0))) next
+    colData_df[[cn]] <- as.numeric(scale(v))
+    keep_covars <- c(keep_covars, cn)
+  } else {
+    v <- droplevels(factor(v))
+    if (nlevels(v) < 2) next
+    colData_df[[cn]] <- v
+    keep_covars <- c(keep_covars, cn)
+  }
+}
+design_terms <- unique(c(keep_covars, grp_col))
+need <- intersect(design_terms, colnames(colData_df))
+idx_complete <- stats::complete.cases(colData_df[, need, drop = FALSE])
+colData_df      <- colData_df[idx_complete, , drop = FALSE]
+rna_counts_filt <- rna_counts_filt[, rownames(colData_df), drop = FALSE]
+colData_df[[grp_col]] <- droplevels(colData_df[[grp_col]])
+if (nlevels(colData_df[[grp_col]]) < 2)
+  stop("After NA removal, grouping variable '", grp_col, "' has <2 levels.")
+
+## 3) Try full design; if not full rank, fall back to ~ group only
+make_dds <- function(terms) {
+  form <- as.formula(paste("~", paste(terms, collapse = " + ")))
+  # drop constant columns detected via model.matrix (keep intercept)
+  mm <- model.matrix(form, data = colData_df)
+  const_cols <- setdiff(which(apply(mm, 2, function(z) all(z == z[1]))), 1L)
+  if (length(const_cols)) {
+    mm <- mm[, -const_cols, drop = FALSE]
+    survive <- setdiff(colnames(mm), "(Intercept)")
+    if (!length(survive)) survive <- grp_col
+    form <- as.formula(paste("~", paste(unique(sub("^([^:]+).*", "\\1", survive)), collapse = " + ")))
+  }
+  message("Trying design: ", deparse(form))
+  dds_try <- DESeqDataSetFromMatrix(countData = rna_counts_filt,
+                                    colData   = colData_df,
+                                    design    = form)
+  list(dds = dds_try, formula = form)
+}
+
+attempt <- try(make_dds(design_terms), silent = TRUE)
+if (inherits(attempt, "try-error")) {
+  # if it failed before, force minimal model
+  message("Falling back to minimal design: ~ ", grp_col)
+  attempt <- make_dds(grp_col)
+}
+
+# Now try DESeq(); if full-rank error occurs, simplify to ~ group
+dds_obj <- try(DESeq(attempt$dds), silent = TRUE)
+if (inherits(dds_obj, "try-error") &&
+    grepl("not full rank", conditionMessage(attr(dds_obj, "condition")), ignore.case = TRUE)) {
+  message("Model not full rank. Retrying with design: ~ ", grp_col)
+  attempt <- make_dds(grp_col)
+  dds_obj <- DESeq(attempt$dds)
+}
+final_formula <- attempt$formula
+message("Final design used: ", deparse(final_formula))
+
+## 4) Results for contrast (Tumor vs Normal if available; else last vs first)
+levs <- levels(colData_df[[grp_col]])
+num_level <- if ("Tumor"  %in% levs) "Tumor"  else levs[length(levs)]
+den_level <- if ("Normal" %in% levs) "Normal" else levs[1]
+res <- results(dds_obj, format = "DataFrame",
+               contrast = c(grp_col, num_level, den_level))
+results <- as.data.frame(res)
+
+
+```
+
+Prepare results dataframe for EnhancedVolcano plotting. Add two columns, "-log10(padj)" and "gene_name". Fill in these columns appropriately.
+```{r}
+## 5) Prep for EnhancedVolcano
+results$padj[is.na(results$padj)] <- 1
+results$`-log10(padj)` <- -log10(pmax(results$padj, .Machine$double.eps))
+
+gid_col   <- grep("gene.?id|ensembl", names(rna_genes),  ignore.case = TRUE, value = TRUE)[1]
+gname_col <- grep("gene.?name|symbol", names(rna_genes), ignore.case = TRUE, value = TRUE)[1]
+if (!is.na(gid_col) && !is.na(gname_col) && !is.null(rownames(results))) {
+  id2name <- setNames(as.character(rna_genes[[gname_col]]),
+                      as.character(rna_genes[[gid_col]]))
+  results$gene_name <- id2name[rownames(results)]
+} else {
+  results$gene_name <- rownames(results)
+}
+results$gene_name[is.na(results$gene_name) | results$gene_name == ""] <- rownames(results)[is.na(results$gene_name) | results$gene_name == ""]
+
+cat("Grouping used:", grp_col, " | levels:", paste(levels(colData_df[[grp_col]]), collapse = ", "), "\n")
+head(results[, c("log2FoldChange","padj","-log10(padj)","gene_name")])
+
+```
+```{r}
+# ---- Problem 4: install/load EnhancedVolcano and plot ----
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+if (!requireNamespace("EnhancedVolcano", quietly = TRUE)) {
+  BiocManager::install("EnhancedVolcano", ask = FALSE, update = FALSE)
+}
+library(EnhancedVolcano)
+
+stopifnot(all(c("log2FoldChange","-log10(padj)","gene_name") %in% colnames(results)))
+
+p <- EnhancedVolcano(
+  results,
+  lab       = results$gene_name,
+  x         = "log2FoldChange",
+  y         = "-log10(padj)",
+  title     = "Sample Definition: Tumor vs Normal Tissue (or chosen contrast)",
+  pointSize = 1.0,
+  labSize   = 5.0
+)
+
+# Optional: save the figure next to your Rmd
+# ggsave("volcano_contrast.png", p, width = 8, height = 6, dpi = 300)
+
+```
+
+
+
+*4*
+Now we will use the EnhancedVolcano package to plot our results. The code is already completed and should run without adjustment if all code up to here is correct.
+```{r}
+EnhancedVolcano(results,
+                lab = results$gene_name,
+                x = 'log2FoldChange',
+                y = '-log10(padj)',
+                title = 'Sample Definition: Tumor vs Normal Tissue',
+                pointSize = 1.0,
+                labSize = 5.0)
+```
+
+*5*
+# Explain what genes from each part of the Volcano Plot mean in terms of their significance and up/down regulation. 
+top-right genes:     Significantly UP-regulated in the numerator group (large +log2FC, low padj).
+bottom-right genes:  Up-regulated in the numerator group but NOT statistically significant ( +log2FC, high padj).
+
+top-left genes:      Significantly DOWN-regulated in the numerator group
+                     (i.e., higher in the denominator group; large –log2FC, low padj).
+bottom-left genes:   Down-regulated in the numerator group but NOT significant ( –log2FC, high padj).
+
+top-middle genes:    Near zero effect size (log2FC ≈ 0) but statistically significant (low padj) —
+                     small expression change yet consistent across samples.
+bottom-middle genes: Near zero effect size AND not significant (high padj) — no meaningful difference. 
+
+Save the picture of the volcano plot (using either ggsave() or right clicking and manually downloading the image and push this .Rmd and the image to GitHub)
